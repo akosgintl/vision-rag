@@ -1,0 +1,47 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # ─── Application ──────────────────────────────────
+  - job_name: "proxy"
+    static_configs:
+      - targets: ["proxy:8000"]
+    metrics_path: /metrics
+
+  # ─── Model Backends ───────────────────────────────
+  - job_name: "vllm-colpali"
+    static_configs:
+      - targets: ["colpali:8001"]
+    metrics_path: /metrics
+
+  - job_name: "vllm-qwen3vl"
+    static_configs:
+      - targets: ["qwen3vl:8002"]
+    metrics_path: /metrics
+
+  - job_name: "vllm-qwen25"
+    static_configs:
+      - targets: ["qwen25:8003"]
+    metrics_path: /metrics
+
+  # ─── Infrastructure ───────────────────────────────
+  - job_name: "qdrant"
+    static_configs:
+      - targets: ["qdrant:6333"]
+    metrics_path: /metrics
+
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+    metrics_path: /metrics
+
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+    metrics_path: /metrics
+
+  - job_name: "minio"
+    static_configs:
+      - targets: ["minio:9000"]
+    metrics_path: /minio/v2/metrics/cluster

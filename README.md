@@ -1,1 +1,1 @@
-# vision-rag
+# visual-rag

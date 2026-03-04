@@ -1,0 +1,8 @@
+# Generated pipeline outputs
+colpali/embedding_output/
+extract/extraction_output/
+
+# Test documents (large binaries)
+test/*.docx
+test/*.pdf
+test/*.png

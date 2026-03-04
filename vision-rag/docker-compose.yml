@@ -1,0 +1,296 @@
+version: "3.9"
+
+services:
+  # ═══════════════════════════════════════════════════════
+  #  vLLM MODEL SERVERS (all sharing one A100 80GB GPU)
+  # ═══════════════════════════════════════════════════════
+
+  colpali:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model TomoroAI/tomoro-ai-colqwen3-embed-8b-awq
+      --port 8001
+      --gpu-memory-utilization 0.10
+      --max-model-len 32768
+      --dtype auto
+      --task embed
+      --trust-remote-code
+      --disable-log-requests
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - model-cache:/root/.cache/huggingface
+      - ./lmcache_config.yaml:/etc/lmcache/config.yaml
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - LMC_CONFIG_FILE=/etc/lmcache/config.yaml
+      - HF_TOKEN=${HF_TOKEN:-}
+    networks:
+      - model-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  qwen3vl:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model Qwen/Qwen3-VL-2B-Instruct
+      --port 8002
+      --gpu-memory-utilization 0.08
+      --max-model-len 4096
+      --dtype float16
+      --limit-mm-per-prompt image=5
+      --trust-remote-code
+      --disable-log-requests
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - model-cache:/root/.cache/huggingface
+      - ./lmcache_config.yaml:/etc/lmcache/config.yaml
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - LMC_CONFIG_FILE=/etc/lmcache/config.yaml
+      - HF_TOKEN=${HF_TOKEN:-}
+    networks:
+      - model-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  qwen25:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model Qwen/Qwen2.5-7B-Instruct-AWQ
+      --port 8003
+      --gpu-memory-utilization 0.18
+      --max-model-len 8192
+      --quantization awq
+      --trust-remote-code
+      --enable-chunked-prefill
+      --disable-log-requests
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - model-cache:/root/.cache/huggingface
+      - ./lmcache_config.yaml:/etc/lmcache/config.yaml
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - LMC_CONFIG_FILE=/etc/lmcache/config.yaml
+      - HF_TOKEN=${HF_TOKEN:-}
+    networks:
+      - model-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════════════════
+  #  FASTAPI PROXY
+  # ═══════════════════════════════════════════════════════
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      colpali:
+        condition: service_healthy
+      qwen3vl:
+        condition: service_healthy
+      qwen25:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment: &proxy-env
+      - COLPALI_URL=http://colpali:8001
+      - QWEN3VL_URL=http://qwen3vl:8002
+      - QWEN25_URL=http://qwen25:8003
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - POSTGRES_DSN=postgresql://visionrag:${POSTGRES_PASSWORD:-changeme}@postgres:5432/visionrag
+      - API_KEY=${API_KEY:-}
+      - DEBUG=${DEBUG:-false}
+    networks:
+      - model-net
+    restart: unless-stopped
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["celery", "-A", "proxy.tasks", "worker", "--loglevel=info", "--concurrency=2"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment: *proxy-env
+    networks:
+      - model-net
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════════════════
+  #  INFRASTRUCTURE
+  # ═══════════════════════════════════════════════════════
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - model-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    networks:
+      - model-net
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    networks:
+      - model-net
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: visionrag
+      POSTGRES_USER: visionrag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-visionrag_secret}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      - model-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U visionrag"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ═══════════════════════════════════════════════════════
+  #  MONITORING
+  # ═══════════════════════════════════════════════════════
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+    networks:
+      - model-net
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    environment:
+      - DATA_SOURCE_NAME=postgresql://visionrag:${POSTGRES_PASSWORD:-changeme}@postgres:5432/visionrag?sslmode=disable
+    networks:
+      - model-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - model-net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - model-net
+    restart: unless-stopped
+
+volumes:
+  model-cache:
+  redis-data:
+  qdrant-data:
+  minio-data:
+  pg-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  model-net:
+    driver: bridge
